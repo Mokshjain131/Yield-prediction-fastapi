@@ -3,9 +3,19 @@ name = "yield-prediction-fastapi"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
-requires-python = ">=3.13"
+requires-python = ">=3.12"
 dependencies = [
-    "fastapi>=0.117.1",
-    "pydantic>=2.11.9",
-    "uvicorn>=0.37.0",
+    "category-encoders==2.8.1",
+    "fastapi==0.111.0",
+    "joblib==1.4.2",
+    "numpy==2.0.2",
+    "pandas==2.2.2",
+    "pydantic==2.7.3",
+    "pyjwt==2.9.0",
+    "python-dotenv==1.0.1",
+    "requests==2.31.0",
+    "scikit-learn>=1.6.0",
+    "supabase==2.1.0",
+    "uvicorn[standard]==0.30.0",
+    "xgboost==3.0.5",
 ]
