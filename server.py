@@ -65,6 +65,8 @@ SUPABASE_JWT_SECRET = os.getenv("SUPABASE_JWT_SECRET")
 MODEL_PATH = Path(os.getenv("MODEL_PATH", "xgb_model.joblib"))
 TARGET_ENCODER_PATH = Path(os.getenv("TARGET_ENCODER_PATH", "target_encoder.joblib"))
 DISABLE_AUTH = os.getenv("DISABLE_AUTH") == "1"
+SUPABASE_REQUESTS_TABLE = os.getenv("SUPABASE_REQUESTS_TABLE", "prediction_requests")
+SUPABASE_RESULTS_TABLE = os.getenv("SUPABASE_RESULTS_TABLE", "prediction_results")
 
 # All possible seasons for one-hot encoding
 ALL_SEASONS = ['Whole Year ', 'Kharif     ', 'Rabi       ', 'Autumn     ', 'Summer     ', 'Winter     ']
@@ -161,7 +163,7 @@ def load_model() -> tuple[Any, Any]:
 # ---------------------------------------------------------------------------
 # Preprocessing pipeline
 # ---------------------------------------------------------------------------
-def preprocess_data(data: PredictionInput, target_encoder: Any) -> np.ndarray:
+def preprocess_data(data: PredictionInput, target_encoder: Any) -> Any:
     """
     Preprocess the input data according to the training pipeline:
     1. Remove Coconut crops (problematic)
@@ -350,7 +352,7 @@ async def debug_supabase():
         return {"ok": False, "info": info, "error": "Supabase not configured or client init failed"}
     # Try a lightweight select to verify connectivity
     try:
-        res = sb.table("prediction_requests").select("id").limit(1).execute()  # type: ignore[attr-defined]
+        res = sb.table(SUPABASE_REQUESTS_TABLE).select("id").limit(1).execute()  # type: ignore[attr-defined]
         return {"ok": True, "info": info, "select_sample": getattr(res, "data", None)}
     except Exception as e:
         return {"ok": False, "info": info, "error": str(e)}
@@ -369,6 +371,7 @@ async def predict(payload: PredictionInput, user: AuthUser = Depends(get_current
 
     pred_value: float | None = None
     recs: list[str] = []
+    response_obj: PredictionResponse | None = None
 
     if model_connected and model is not None and target_encoder is not None:
         try:
@@ -389,7 +392,14 @@ async def predict(payload: PredictionInput, user: AuthUser = Depends(get_current
         
         recs = generate_recommendations(payload)
 
-    # Always attempt to log request to Supabase (prediction_requests table)
+        # Build the response object once and reuse it for DB insert and HTTP response
+        response_obj = PredictionResponse(
+            predicted_yield=pred_value,
+            recommendations=recs,
+            model_version="v1",
+        )
+
+    # Always attempt to log request to Supabase (requests table)
     sb = get_supabase()
     if sb is not None:
         payload_data = payload.model_dump()
@@ -404,19 +414,48 @@ async def predict(payload: PredictionInput, user: AuthUser = Depends(get_current
             "created_at": datetime.now(timezone.utc).isoformat(),
         }
         try:
-            sb.table("prediction_requests").insert(record).execute()  # type: ignore[attr-defined]
+            sb.table(SUPABASE_REQUESTS_TABLE).insert(record).execute()  # type: ignore[attr-defined]
         except Exception as e:  # pragma: no cover
             logging.error(f"Supabase log insert failed: {e}")
+
+        # If we have a successful prediction, also write to the results table
+        if pred_value is not None and response_obj is not None:
+            # Include prediction and recommendations inside payload JSON too for easier querying
+            augmented_payload = payload.model_dump()
+            augmented_payload["predicted_yield"] = pred_value
+            augmented_payload["recommendations"] = recs
+
+            results_record = {
+                "user_id": user.user_id,
+                "payload": payload.model_dump(),
+                # Store exactly what we return to the client as a nested object
+                "response": response_obj.model_dump(),
+                # Also include flattened columns for easier SQL querying
+                "predicted_yield": response_obj.predicted_yield,
+                "unit": response_obj.unit,
+                "recommendations": response_obj.recommendations,
+                "model_version": response_obj.model_version,
+                "created_at": datetime.now(timezone.utc).isoformat(),
+            }
+            try:
+                sb.table(SUPABASE_RESULTS_TABLE).insert(results_record).execute()  # type: ignore[attr-defined]
+            except Exception as e:  # pragma: no cover
+                logging.error(f"Supabase results insert failed (table={SUPABASE_RESULTS_TABLE}): {e}")
+                # Fallback attempt for legacy table name
+                try:
+                    legacy_table = "predictions"
+                    if SUPABASE_RESULTS_TABLE != legacy_table:
+                        sb.table(legacy_table).insert(results_record).execute()  # type: ignore[attr-defined]
+                        logging.info("Supabase results insert succeeded via legacy table 'predictions'")
+                except Exception as e2:  # pragma: no cover
+                    logging.error(f"Supabase legacy results insert failed (table=predictions): {e2}")
 
     # Response changes based on model connectivity
     if not model_connected or pred_value is None:
         return PlainTextResponse("Model not connected", status_code=200)
 
-    return PredictionResponse(
-        predicted_yield=pred_value,
-        recommendations=recs,
-        model_version="v1",
-    )
+    # Return the exact same variables we stored
+    return response_obj
 
 
 if __name__ == "__main__":  # pragma: no cover
