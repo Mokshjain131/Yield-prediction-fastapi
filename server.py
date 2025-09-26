@@ -6,7 +6,7 @@ Environment Variables (set before running):
   SUPABASE_SERVICE_ROLE_KEY=... (server key for inserts)
   SUPABASE_JWT_SECRET=... (optional: if provided we decode locally)
   MODEL_PATH=path/to/yield_model.joblib (optional; fallback heuristic used if missing)
-  DISABLE_AUTH=1 (only for local dev/testing – bypasses supabase auth)
+  DISABLE_AUTH=1 (only for local dev/testing - bypasses supabase auth)
 
 Run: uvicorn server:app --reload
 """
@@ -14,11 +14,13 @@ Run: uvicorn server:app --reload
 from __future__ import annotations
 
 import os
+import logging
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, List, Optional
 
 from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi.responses import PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -108,20 +110,10 @@ def load_model() -> Any:
             _MODEL = joblib.load(MODEL_PATH)
             return _MODEL
         except Exception as e:  # pragma: no cover
-            print(f"Failed to load model: {e}. Falling back to heuristic.")
-    # Fallback: simple heuristic pseudo-model
-    class HeuristicModel:
-        def predict(self, rows):  # rows: List[List[float]]
-            outs = []
-            for r in rows:
-                # naive weighted sum scaled
-                rainfall, temp, soil, n, p, k = r
-                base = (0.01 * rainfall + 0.05 * temp + 2 * soil + 0.004 * n + 0.003 * p + 0.002 * k)
-                outs.append(base)
-            return outs
-
-    _MODEL = HeuristicModel()
-    return _MODEL
+            print(f"Failed to load model: {e}.")
+            raise FileNotFoundError("Model not connected") from e
+    # No model file or joblib missing
+    raise FileNotFoundError("Model not connected")
 
 
 # ---------------------------------------------------------------------------
@@ -157,10 +149,19 @@ _SUPABASE_CLIENT = None  # type: ignore
 def get_supabase():  # -> Optional[Client]
     global _SUPABASE_CLIENT
     if not SUPABASE_URL or not (SUPABASE_SERVICE_ROLE_KEY or SUPABASE_ANON_KEY):
+        if not SUPABASE_URL:
+            logging.info("Supabase not configured: SUPABASE_URL missing")
+        if not (SUPABASE_SERVICE_ROLE_KEY or SUPABASE_ANON_KEY):
+            logging.info("Supabase not configured: No key provided (SERVICE_ROLE or ANON)")
         return None
     if _SUPABASE_CLIENT is None and create_client is not None:
         key = SUPABASE_SERVICE_ROLE_KEY or SUPABASE_ANON_KEY  # prefer service key for inserts
-        _SUPABASE_CLIENT = create_client(SUPABASE_URL, key)  # type: ignore
+        try:
+            _SUPABASE_CLIENT = create_client(SUPABASE_URL, key)  # type: ignore
+            logging.info("Supabase client initialized")
+        except Exception as e:
+            logging.error(f"Supabase client init failed: {e}")
+            _SUPABASE_CLIENT = None
     return _SUPABASE_CLIENT
 
 
@@ -210,47 +211,89 @@ app.add_middleware(
 )
 
 
+def _supabase_status() -> dict[str, bool | str]:
+    return {
+        "url_set": bool(SUPABASE_URL),
+        "service_key_set": bool(SUPABASE_SERVICE_ROLE_KEY),
+        "anon_key_set": bool(SUPABASE_ANON_KEY),
+        "client_available": create_client is not None,
+        "bypass_auth": DISABLE_AUTH,
+    }
+
+
 @app.get("/health")
 async def health():
-    return {"status": "ok", "auth": not DISABLE_AUTH}
+    return {"status": "ok", "auth": not DISABLE_AUTH, "supabase": _supabase_status()}
+
+
+@app.get("/debug/supabase")
+async def debug_supabase():
+    sb = get_supabase()
+    info = _supabase_status()
+    if sb is None:
+        return {"ok": False, "info": info, "error": "Supabase not configured or client init failed"}
+    # Try a lightweight select to verify connectivity
+    try:
+        res = sb.table("prediction_requests").select("id").limit(1).execute()  # type: ignore[attr-defined]
+        return {"ok": True, "info": info, "select_sample": getattr(res, "data", None)}
+    except Exception as e:
+        return {"ok": False, "info": info, "error": str(e)}
 
 
 @app.post("/predict", response_model=PredictionResponse)
 async def predict(payload: PredictionInput, user: AuthUser = Depends(get_current_user)):
-    model = load_model()
+    # Try to load model but do not short-circuit; we always attempt a Supabase insert
+    model = None
+    model_connected = True
+    try:
+        model = load_model()
+    except FileNotFoundError:
+        model_connected = False
+
+    # Build features list
     try:
         features = [getattr(payload, f) for f in FEATURE_ORDER]
     except AttributeError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
-    try:
-        pred = model.predict([features])[0]
-        pred_value = float(pred)
-    except Exception as e:  # pragma: no cover
-        raise HTTPException(status_code=500, detail=f"Prediction failed: {e}") from e
 
-    recs = generate_recommendations(payload)
+    pred_value: float | None = None
+    recs: list[str] = []
 
-    # Fire-and-forget logging to Supabase (ignore failures)
+    if model_connected and model is not None:
+        try:
+            pred = model.predict([features])[0]
+            pred_value = float(pred)
+        except Exception as e:  # pragma: no cover
+            raise HTTPException(status_code=500, detail=f"Prediction failed: {e}") from e
+        recs = generate_recommendations(payload)
+
+    # Always attempt to log request to Supabase (prediction_requests table)
     sb = get_supabase()
     if sb is not None:
+        payload_data = payload.model_dump()
+        if pred_value is not None:
+            # augment payload with result so it's visible in test table
+            payload_data["predicted_yield"] = pred_value
+            payload_data["recommendations"] = recs
         record = {
             "user_id": user.user_id,
-            "predicted_yield": pred_value,
-            "payload": payload.model_dump(),
-            "recommendations": recs,
-            "crop_type": payload.crop_type,
-            "region": payload.region,
+            "payload": payload_data,
+            "note": "predicted" if pred_value is not None else "model_not_connected",
             "created_at": datetime.now(timezone.utc).isoformat(),
         }
         try:
-            sb.table("predictions").insert(record).execute()  # type: ignore[attr-defined]
+            sb.table("prediction_requests").insert(record).execute()  # type: ignore[attr-defined]
         except Exception as e:  # pragma: no cover
-            print(f"Log insert failed: {e}")
+            logging.error(f"Supabase log insert failed: {e}")
+
+    # Response changes based on model connectivity
+    if not model_connected or pred_value is None:
+        return PlainTextResponse("Model not connected", status_code=200)
 
     return PredictionResponse(
         predicted_yield=pred_value,
         recommendations=recs,
-        model_version="heuristic" if isinstance(model, object) and joblib is None else "v1",
+        model_version="v1",
     )
 
 
