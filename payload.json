@@ -1,10 +1,10 @@
 ﻿{
-  "rainfall_mm": 18.2,
-  "temperature_c": 26.1,
-  "soil_moisture": 0.33,
-  "nitrogen": 41,
-  "phosphorus": 22,
-  "potassium": 31,
-  "crop_type": "rice",
-  "region": "delta"
+  "Crop": "Arecanut",
+  "Crop_Year": 1997,
+  "Season": "Whole Year ",
+  "State": "Assam",
+  "Area": 73814.0,
+  "Annual_Rainfall": 2051.4,
+  "Fertilizer": 7024878.38,
+  "Pesticide": 22882.34
 }

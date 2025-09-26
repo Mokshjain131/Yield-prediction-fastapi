@@ -34,8 +34,14 @@ except Exception:
 # Optional heavy deps imported lazily
 try:  # noqa: SIM105
     import joblib  # type: ignore
+    import pandas as pd  # type: ignore
+    import numpy as np  # type: ignore
+    import category_encoders as ce  # type: ignore
 except Exception:  # pragma: no cover
     joblib = None  # type: ignore
+    pd = None  # type: ignore
+    np = None  # type: ignore
+    ce = None  # type: ignore
 
 try:  # noqa: SIM105
     from supabase import create_client, Client  # type: ignore
@@ -56,31 +62,64 @@ SUPABASE_URL = os.getenv("SUPABASE_URL", "")
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
 SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY")
 SUPABASE_JWT_SECRET = os.getenv("SUPABASE_JWT_SECRET")
-MODEL_PATH = Path(os.getenv("MODEL_PATH", "model/yield_model.joblib"))
+MODEL_PATH = Path(os.getenv("MODEL_PATH", "xgb_model.joblib"))
+TARGET_ENCODER_PATH = Path(os.getenv("TARGET_ENCODER_PATH", "target_encoder.joblib"))
 DISABLE_AUTH = os.getenv("DISABLE_AUTH") == "1"
 
-FEATURE_ORDER = [
-    "rainfall_mm",
-    "temperature_c",
-    "soil_moisture",
-    "nitrogen",
-    "phosphorus",
-    "potassium",
+# All possible seasons for one-hot encoding
+ALL_SEASONS = ['Whole Year ', 'Kharif     ', 'Rabi       ', 'Autumn     ', 'Summer     ', 'Winter     ']
+
+# Valid crop types
+VALID_CROPS = [
+    'Arecanut', 'Arhar/Tur', 'Castor seed', 'Cotton(lint)', 'Dry chillies', 'Gram', 'Jute', 'Linseed', 
+    'Maize', 'Mesta', 'Niger seed', 'Onion', 'Other  Rabi pulses', 'Potato', 'Rapeseed &Mustard', 
+    'Rice', 'Sesamum', 'Small millets', 'Sugarcane', 'Sweet potato', 'Tapioca', 'Tobacco', 'Turmeric', 
+    'Wheat', 'Bajra', 'Black pepper', 'Cardamom', 'Coriander', 'Garlic', 'Ginger', 'Groundnut', 
+    'Horse-gram', 'Jowar', 'Ragi', 'Cashewnut', 'Banana', 'Soyabean', 'Barley', 'Khesari', 'Masoor', 
+    'Moong(Green Gram)', 'Other Kharif pulses', 'Safflower', 'Sannhamp', 'Sunflower', 'Urad', 
+    'Peas & beans (Pulses)', 'other oilseeds', 'Other Cereals', 'Cowpea(Lobia)', 'Oilseeds total', 
+    'Guar seed', 'Other Summer Pulses', 'Moth'
 ]
+
+# Valid states
+VALID_STATES = [
+    'Assam', 'Karnataka', 'Kerala', 'Meghalaya', 'West Bengal', 'Puducherry', 'Goa', 'Andhra Pradesh', 
+    'Tamil Nadu', 'Odisha', 'Bihar', 'Gujarat', 'Madhya Pradesh', 'Maharashtra', 'Mizoram', 'Punjab', 
+    'Uttar Pradesh', 'Haryana', 'Himachal Pradesh', 'Tripura', 'Nagaland', 'Chhattisgarh', 'Uttarakhand', 
+    'Jharkhand', 'Delhi', 'Manipur', 'Jammu and Kashmir', 'Telangana', 'Arunachal Pradesh', 'Sikkim'
+]
+
+# Valid seasons
+VALID_SEASONS = ['Whole Year ', 'Kharif     ', 'Rabi       ', 'Autumn     ', 'Summer     ', 'Winter     ']
 
 
 # ---------------------------------------------------------------------------
 # Data Schemas
 # ---------------------------------------------------------------------------
 class PredictionInput(BaseModel):
-    rainfall_mm: float = Field(..., ge=0)
-    temperature_c: float
-    soil_moisture: float = Field(..., ge=0, le=1)
-    nitrogen: float = Field(..., ge=0)
-    phosphorus: float = Field(..., ge=0)
-    potassium: float = Field(..., ge=0)
-    crop_type: str
-    region: str
+    Crop: str = Field(..., description="The name of the crop cultivated")
+    Crop_Year: int = Field(..., ge=1990, le=2030, description="The year in which the crop was grown")
+    Season: str = Field(..., description="The specific cropping season")
+    State: str = Field(..., description="The Indian state where the crop was cultivated")
+    Area: float = Field(..., gt=0, description="The total land area (in hectares) under cultivation")
+    Annual_Rainfall: float = Field(..., ge=0, description="The annual rainfall received (in mm)")
+    Fertilizer: float = Field(..., ge=0, description="The total amount of fertilizer used (in kilograms)")
+    Pesticide: float = Field(..., ge=0, description="The total amount of pesticide used (in kilograms)")
+    
+    def model_validate(cls, values):
+        # Validate crop
+        if values.get('Crop') not in VALID_CROPS:
+            raise ValueError(f"Crop must be one of: {VALID_CROPS}")
+        
+        # Validate state
+        if values.get('State') not in VALID_STATES:
+            raise ValueError(f"State must be one of: {VALID_STATES}")
+        
+        # Validate season
+        if values.get('Season') not in VALID_SEASONS:
+            raise ValueError(f"Season must be one of: {VALID_SEASONS}")
+        
+        return values
 
 
 class PredictionResponse(BaseModel):
@@ -99,21 +138,84 @@ class AuthUser(BaseModel):
 # Model Loader (lazy singleton)
 # ---------------------------------------------------------------------------
 _MODEL: Any | None = None
+_TARGET_ENCODER: Any | None = None
 
 
-def load_model() -> Any:
-    global _MODEL
-    if _MODEL is not None:
-        return _MODEL
-    if MODEL_PATH.exists() and joblib is not None:
-        try:
-            _MODEL = joblib.load(MODEL_PATH)
-            return _MODEL
-        except Exception as e:  # pragma: no cover
-            print(f"Failed to load model: {e}.")
-            raise FileNotFoundError("Model not connected") from e
-    # No model file or joblib missing
-    raise FileNotFoundError("Model not connected")
+def load_model() -> tuple[Any, Any]:
+    global _MODEL, _TARGET_ENCODER
+    if _MODEL is not None and _TARGET_ENCODER is not None:
+        return _MODEL, _TARGET_ENCODER
+    
+    if not (MODEL_PATH.exists() and TARGET_ENCODER_PATH.exists() and joblib is not None):
+        raise FileNotFoundError("Model files not found or joblib not available")
+    
+    try:
+        _MODEL = joblib.load(MODEL_PATH)
+        _TARGET_ENCODER = joblib.load(TARGET_ENCODER_PATH)
+        return _MODEL, _TARGET_ENCODER
+    except Exception as e:  # pragma: no cover
+        print(f"Failed to load models: {e}.")
+        raise FileNotFoundError("Model not connected") from e
+
+
+# ---------------------------------------------------------------------------
+# Preprocessing pipeline
+# ---------------------------------------------------------------------------
+def preprocess_data(data: PredictionInput, target_encoder: Any) -> np.ndarray:
+    """
+    Preprocess the input data according to the training pipeline:
+    1. Remove Coconut crops (problematic)
+    2. Create derived features (Fertilizer_per_Area, Pesticide_per_Area)
+    3. Apply target encoding to Crop and State
+    4. One-hot encode Season
+    5. Return features in correct order
+    """
+    if pd is None or np is None:
+        raise ImportError("pandas and numpy are required for preprocessing")
+    
+    # Check if Coconut crop (should be filtered out)
+    if data.Crop == 'Coconut ':
+        raise ValueError("Coconut crop is not supported due to data quality issues")
+    
+    # Create DataFrame from input
+    df = pd.DataFrame([{
+        'Crop': data.Crop,
+        'Crop_Year': data.Crop_Year,
+        'Season': data.Season,
+        'State': data.State,
+        'Area': data.Area,
+        'Annual_Rainfall': data.Annual_Rainfall,
+        'Fertilizer': data.Fertilizer,
+        'Pesticide': data.Pesticide
+    }])
+    
+    # Create derived features
+    df['Fertilizer_per_Area'] = df['Fertilizer'] / (df['Area'] + 1e-6)
+    df['Pesticide_per_Area'] = df['Pesticide'] / (df['Area'] + 1e-6)
+    
+    # Drop columns that won't be used for prediction
+    X = df.drop(['Area', 'Fertilizer', 'Pesticide'], axis=1)
+    
+    # Apply target encoding
+    X_target_encoded = target_encoder.transform(X)
+    
+    # One-hot encode Season
+    X_target_encoded['Season'] = pd.Categorical(
+        X_target_encoded['Season'],
+        categories=ALL_SEASONS
+    )
+    
+    # Create one-hot encoded features
+    X_final = pd.get_dummies(X_target_encoded, columns=['Season'], dtype=int)
+    
+    # Ensure all season columns are present (in case some are missing)
+    for season in ALL_SEASONS:
+        col_name = f'Season_{season}'
+        if col_name not in X_final.columns:
+            X_final[col_name] = 0
+    
+    # Return as numpy array
+    return X_final.values
 
 
 # ---------------------------------------------------------------------------
@@ -121,22 +223,36 @@ def load_model() -> Any:
 # ---------------------------------------------------------------------------
 def generate_recommendations(data: PredictionInput) -> List[str]:
     recs: List[str] = []
-    if data.soil_moisture < 0.3:
-        recs.append("Increase irrigation (soil moisture < 30%)")
-    elif data.soil_moisture > 0.8:
-        recs.append("Reduce irrigation to avoid waterlogging")
-    if data.nitrogen < 50:
-        recs.append("Apply nitrogen-rich fertilizer")
-    if data.phosphorus < 30:
-        recs.append("Add phosphorus to support root growth")
-    if data.potassium < 40:
-        recs.append("Apply potassium for stress tolerance")
-    if data.temperature_c < 15:
-        recs.append("Cool conditions: consider cold-tolerant varieties")
-    elif data.temperature_c > 34:
-        recs.append("High heat: irrigate mornings/evenings to reduce stress")
+    
+    # Check fertilizer per area
+    fertilizer_per_area = data.Fertilizer / (data.Area + 1e-6)
+    if fertilizer_per_area < 50:
+        recs.append("Consider increasing fertilizer application per hectare")
+    elif fertilizer_per_area > 200:
+        recs.append("Consider reducing fertilizer application to avoid over-fertilization")
+    
+    # Check pesticide per area
+    pesticide_per_area = data.Pesticide / (data.Area + 1e-6)
+    if pesticide_per_area < 0.1:
+        recs.append("Consider increasing pesticide application for pest control")
+    elif pesticide_per_area > 1.0:
+        recs.append("Consider reducing pesticide application to avoid overuse")
+    
+    # Check rainfall
+    if data.Annual_Rainfall < 500:
+        recs.append("Low rainfall: consider irrigation or drought-resistant varieties")
+    elif data.Annual_Rainfall > 2000:
+        recs.append("High rainfall: ensure proper drainage to prevent waterlogging")
+    
+    # Check area size
+    if data.Area < 1:
+        recs.append("Small plot: consider intensive farming techniques")
+    elif data.Area > 1000:
+        recs.append("Large plot: consider mechanized farming for efficiency")
+    
     if not recs:
         recs.append("Conditions look good. Maintain current practices.")
+    
     return recs
 
 
@@ -242,29 +358,35 @@ async def debug_supabase():
 
 @app.post("/predict", response_model=PredictionResponse)
 async def predict(payload: PredictionInput, user: AuthUser = Depends(get_current_user)):
-    # Try to load model but do not short-circuit; we always attempt a Supabase insert
+    # Try to load models but do not short-circuit; we always attempt a Supabase insert
     model = None
+    target_encoder = None
     model_connected = True
     try:
-        model = load_model()
+        model, target_encoder = load_model()
     except FileNotFoundError:
         model_connected = False
-
-    # Build features list
-    try:
-        features = [getattr(payload, f) for f in FEATURE_ORDER]
-    except AttributeError as e:
-        raise HTTPException(status_code=400, detail=str(e)) from e
 
     pred_value: float | None = None
     recs: list[str] = []
 
-    if model_connected and model is not None:
+    if model_connected and model is not None and target_encoder is not None:
         try:
-            pred = model.predict([features])[0]
-            pred_value = float(pred)
+            # Preprocess the data
+            features = preprocess_data(payload, target_encoder)
+            
+            # Make prediction (model expects log-transformed target)
+            pred_log = model.predict(features)[0]
+            
+            # Transform back from log scale
+            pred_value = float(np.expm1(pred_log))
+            
+        except ValueError as e:
+            # Handle Coconut crop or other validation errors
+            raise HTTPException(status_code=400, detail=str(e)) from e
         except Exception as e:  # pragma: no cover
             raise HTTPException(status_code=500, detail=f"Prediction failed: {e}") from e
+        
         recs = generate_recommendations(payload)
 
     # Always attempt to log request to Supabase (prediction_requests table)
