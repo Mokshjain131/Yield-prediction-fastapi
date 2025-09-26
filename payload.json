@@ -1,0 +1,10 @@
+﻿{
+  "rainfall_mm": 18.2,
+  "temperature_c": 26.1,
+  "soil_moisture": 0.33,
+  "nitrogen": 41,
+  "phosphorus": 22,
+  "potassium": 31,
+  "crop_type": "rice",
+  "region": "delta"
+}
